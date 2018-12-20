@@ -1,0 +1,198 @@
+"""
+This python file contain implementation of several saliency techniques for visualizing neural networks. Minor modification haev been made to algorithms already available
+on GitHub (shared by the authors of these papers) to make them useful for us. A description is provided for every algorithm above the function implementing it
+
+Author: Pranav Dheram
+"""
+import io
+import requests
+from PIL import Image
+import torch
+from torchvision import models, transforms
+from torch.autograd import Variable
+from torch.nn import functional as F
+import numpy as np
+import cv2
+import pdb
+import sys
+import matplotlib.image as mpimg
+import pdb
+import glob
+import xml.etree.ElementTree as ET
+import bounding_boxes as bounding
+import os
+from misc_functions import get_example_params, save_class_activation_images, convert_to_grayscale, save_gradient_images, get_positive_negative_saliency
+import cam as cam_map
+import all_techniques
+
+
+"""
+The following function returns a 'Class Activation Map' introduced here : https://www.cv-foundation.org/openaccess/content_cvpr_2016/papers/Zhou_Learning_Deep_Features_CVPR_2016_paper.pdf
+Popularly called the CAM, this technique finds the most relevant parts of an image according to a model (feature_conv) given the final prediction (class_idx) made by the model
+
+input:
+feature_conv: is the last kernel map in the CNN network being used for image classification
+weight_softmax: is the prodbablity distribution across all the classes. This is learned by our model
+class_idx: index of the class with the maximum probability according to the model
+
+output: output_cam is a 256x256 array which associates imprtance to every part of an image. This importance is a number between 0 and 255. For instance, if the cell (0, 0) in this array was 255, then left corner of the image is highly salient when making the prediction, class_idx
+"""
+def returnCAM(feature_conv, weight_softmax, class_idx):
+    # generate the class activation maps upsample to 256x256
+    size_upsample = (256, 256)
+    bz, nc, h, w = feature_conv.shape
+    output_cam = []
+    for idx in class_idx:
+        cam = weight_softmax[idx].dot(feature_conv.reshape((nc, h*w)))
+        cam = cam.reshape(h, w)
+        cam = cam - np.min(cam)
+        cam_img = cam / np.max(cam)
+        cam_img = np.uint8(255 * cam_img)
+        output_cam.append(cv2.resize(cam_img, size_upsample))
+    return output_cam
+
+
+
+class GuidedBackprop():
+    """
+       Produces gradients generated with guided back propagation from the given image
+    """
+    def __init__(self, model):
+        self.model = model
+        self.gradients = None
+        # Put model in evaluation mode
+        self.model.eval()
+        self.update_relus()
+        self.hook_layers()
+
+    def hook_layers(self):
+        def hook_function(module, grad_in, grad_out):
+            self.gradients = grad_in[0]
+
+        # Register hook to the first layer
+        first_layer = list(self.model.features._modules.items())[0][1]
+        first_layer.register_backward_hook(hook_function)
+
+    def update_relus(self):
+        """
+            Updates relu activation functions so that it only returns positive gradients
+        """
+        def relu_hook_function(module, grad_in, grad_out):
+            """
+            If there is a negative gradient, changes it to zero
+            """
+            if isinstance(module, ReLU):
+                return (torch.clamp(grad_in[0], min=0.0),)
+        # Loop through layers, hook up ReLUs with relu_hook_function
+        for pos, module in self.model.features._modules.items():
+            if isinstance(module, ReLU):
+                module.register_backward_hook(relu_hook_function)
+
+    def generate_gradients(self, input_image, target_class):
+        # Forward pass
+        model_output = self.model(input_image)
+        # Zero gradients
+        self.model.zero_grad()
+        # Target for backprop
+        one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
+        one_hot_output[0][target_class] = 1
+        # Backward pass
+        model_output.backward(gradient=one_hot_output)
+        # Convert Pytorch variable to numpy array
+        # [0] to get rid of the first channel (1,3,224,224)
+        gradients_as_arr = self.gradients.data.numpy()[0]
+        return gradients_as_arr
+
+
+"""
+The following function implements the gradient class activation map or GradCAM introduced by - http://openaccess.thecvf.com/content_ICCV_2017/papers/Selvaraju_Grad-CAM_Visual_Explanations_ICCV_2017_paper.pdf. 
+
+This algorithm is implemented in 2 parts: 
+
+class CamExtractor: CAM extractor extracts feature map obtained from the 'target layer' of our model
+input: model, target layer
+output:
+conv_output: is the feature map from the target layer
+x: classifier output for the given image
+
+Class GradCam: build gradient class activation map - code commented by the original author to explain how it works
+input: model, target layer
+output: 
+cam: is the gradient class activation map generated by our model
+"""
+class CamExtractor():
+    """
+        Extracts cam features from the model
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+    def save_gradient(self, grad):
+        self.gradients = grad
+    def forward_pass_on_convolutions(self, x):
+        """
+            Does a forward pass on convolutions, hooks the function at given layer
+        """
+        conv_output = None
+        for module_pos, module in self.model.features._modules.items():
+            x = module(x)  # Forward
+            if int(module_pos) == self.target_layer:
+                x.register_hook(self.save_gradient)
+                conv_output = x  # Save the convolution output on that layer
+        return conv_output, x
+    def forward_pass(self, x):
+        """
+            Does a full forward pass on the model
+        """
+        # Forward pass on the convolutions
+        conv_output, x = self.forward_pass_on_convolutions(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        # Forward pass on the classifier
+        x = self.model.classifier(x)
+        return conv_output, x
+
+
+class GradCam():
+    """
+        Produces class activation map
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.model.eval()
+        # Define extractor
+        self.extractor = CamExtractor(self.model, target_layer)
+    def generate_cam(self, input_image, target_class=None):
+        # Full forward pass
+        # conv_output is the output of convolutions at specified layer
+        # model_output is the final output of the model (1, 1000)
+        conv_output, model_output = self.extractor.forward_pass(input_image)
+        if target_class is None:
+            target_class = np.argmax(model_output.data.numpy())
+        # Target for backprop
+        one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
+        one_hot_output[0][target_class] = 1
+        # Zero grads
+        self.model.features.zero_grad()
+        self.model.classifier.zero_grad()
+        # Backward pass with specified target
+        model_output.backward(gradient=one_hot_output, retain_graph=True)
+        # Get hooked gradients
+        guided_gradients = self.extractor.gradients.data.numpy()[0]
+        # Get convolution outputs
+        target = conv_output.data.numpy()[0]
+        # Get weights from gradients
+        weights = np.mean(guided_gradients, axis=(1, 2))  # Take averages for each gradient
+        # Create empty numpy array for cam
+        cam = np.ones(target.shape[1:], dtype=np.float32)
+        # Multiply each weight with its conv output and then, sum
+        for i, w in enumerate(weights):
+            cam += w * target[i, :, :]
+        cam = cv2.resize(cam, (224, 224))
+        cam = np.maximum(cam, 0)
+        cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam))  # Normalize between 0-1
+        cam = np.uint8(cam * 255)  # Scale between 0-255 to visualize
+        return cam
+
+
+
