@@ -2,6 +2,8 @@
 The following script generates saliency maps based on methods listed in the file 'all_techniques.py. At its core, we have a image classification task. We use pretrained eural models on ImaegNet dataset which allows us to directly use saliency techniques without building models from scratch. The Readme provided in the directory explains how the code can be run.
 Comments are provided in the code wherever we think necessary. 
 
+made a change
+
 Author: Pranav Dheram
 """
 # simple implementation of CAM in PyTorch for the networks such as ResNet, DenseNet, SqueezeNet, Inception
